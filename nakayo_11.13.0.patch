@@ -1,0 +1,182 @@
+--- ../asterisk-11.13.0_orig/asterisk-11.13.0/channels/chan_sip.c	2014-08-28 00:01:33.000000000 +0900
++++ channels/chan_sip.c	2014-10-31 21:34:12.275763790 +0900
+@@ -650,7 +650,9 @@
+ 	{ CPIM_PIDF_XML,   "presence", "application/cpim-pidf+xml",   "cpim-pidf+xml" },  /* RFC 3863 */
+ 	{ PIDF_XML,        "presence", "application/pidf+xml",        "pidf+xml" },       /* RFC 3863 */
+ 	{ XPIDF_XML,       "presence", "application/xpidf+xml",       "xpidf+xml" },       /* Pre-RFC 3863 with MS additions */
+-	{ MWI_NOTIFICATION,	"message-summary", "application/simple-message-summary", "mwi" } /* RFC 3842: Mailbox notification */
++	{ MWI_NOTIFICATION,	"message-summary", "application/simple-message-summary", "mwi" }, /* RFC 3842: Mailbox notification */
++	{ NAKAYO_PARK,     "callpark", "application/callcontrol",     "nakayo_park" },    /* nakayo_park */
++	{ NAKAYO_LINE,     "line-key-set", "application/text",        "nakayo_line" },    /* nakayo_line */
+ };
+ 
+ /*! \brief The core structure to setup dialogs. We parse incoming messages by using
+@@ -12069,6 +12071,25 @@
+ 	return send_response(p, &resp, XMIT_UNRELIABLE, 0);
+ }
+ 
++/* for nakayo park */
++/*! \brief Transmit response, no retransmits */
++static int transmit_response_with_operation(struct sip_pvt *p, const char *msg, struct sip_request *req) 
++{
++	struct sip_request resp;
++	char str[100];
++	const char *parkslot = get_content_line(req, "operation", '=');
++
++	respprep(&resp, p, msg, req);
++	add_date(&resp);
++
++	if (!ast_strlen_zero(parkslot)) {
++		snprintf(str, sizeof(str), "operation=%s\n", parkslot);
++		add_header(&resp, "Content-Type", "text/plain;charset=UTF-8");
++		add_content(&resp, str);
++	}
++
++	return send_response(p, &resp, XMIT_UNRELIABLE, 0);
++}
+ 
+ /*! \brief Transmit response, Make sure you get an ACK
+ 	This is only used for responses to INVITEs, where we need to make sure we get an ACK
+@@ -14589,6 +14610,14 @@
+ 		}
+ 		ast_str_append(tmp, 0, "</dialog>\n</dialog-info>\n");
+ 		break;
++	case NAKAYO_PARK:
++		if(data->state < 0)
++			break;
++		ast_str_append(tmp, 0, "state=%d\n", (data->state != AST_EXTENSION_NOT_INUSE) ? 1 : 0);
++		break;
++	case NAKAYO_LINE:
++		/* not yet implemented */
++		break;
+ 	case NONE:
+ 	default:
+ 		break;
+@@ -14702,6 +14731,16 @@
+ 		add_header(&req, "Content-Type", subscriptiontype->mediatype);
+ 		p->dialogver++;
+ 		break;
++	case NAKAYO_PARK: /* for nakayo park */
++		{
++			struct ast_str *event = ast_str_alloca(100);
++			ast_str_append(&event, 0, "%s;number=%s", subscriptiontype->event, p->exten);
++			add_header(&req, "Event", event->str);
++		}
++		state_notify_build_xml(data, full, p->exten, p->context, &tmp, p, p->subscribed, mfrom, mto);
++		add_header(&req, "Content-Type", subscriptiontype->mediatype);
++		p->dialogver++;
++		break;
+ 	case NONE:
+ 	default:
+ 		break;
+@@ -21423,6 +21462,23 @@
+ 		}
+ 		transmit_response(p, "200 OK", req);
+ 		return;
++	} else if (!strcasecmp(c, "application/callcontrol")) {
++		/* for nakayo park */
++		const char *parkslot = get_content_line(req, "operation=callpark,number", '=');
++		struct ast_channel *peer = ast_bridged_channel(p->owner);
++		ast_log(LOG_NOTICE, "nakayo parkslot=%s, peer=\n", parkslot);
++		if (!ast_strlen_zero(parkslot) && peer) {
++			pbx_builtin_setvar_helper(peer, "PARKINGEXTEN", parkslot);
++			if (!ast_masq_park_call(peer, p->owner, 0, NULL)) {
++				transmit_response_with_operation(p, "200 OK", req);
++				return;
++			}
++		}
++		if (VERBOSITY_ATLEAST(2))
++			//ast_verbose(VERBOSE_PREFIX_3 "nakayo parkslot=%s, peer=%s\n", parkslot, peer ? (const char*)(peer->name) : "");
++			ast_verbose(VERBOSE_PREFIX_3 "nakayo parkslot=%s, peer=%s\n", parkslot, "");
++		transmit_response_with_operation(p, "403 Forbidden", req);
++		return;
+ 	} else if (!ast_strlen_zero(c = sip_get_header(req, "X-ClientCode"))) {
+ 		/* Client code (from SNOM phone) */
+ 		if (ast_test_flag(&p->flags[0], SIP_USECLIENTCODE)) {
+@@ -27608,6 +27664,7 @@
+ 	struct sip_peer *authpeer = NULL;
+ 	char *event = ast_strdupa(sip_get_header(req, "Event")); /* Get Event package name */
+ 	int resubscribe = (p->subscribed != NONE) && !req->ignore;
++	char *callpark_number = ""; /* for nakayo park */
+ 	char *options;
+ 
+ 	if (p->initreq.headers) {
+@@ -27671,6 +27728,16 @@
+ 	}
+ 	if ((options = strchr(event, ';')) != NULL) {
+ 		*options++ = '\0';
++
++		/* for nakayo park */
++		callpark_number = options;
++		if (!strncasecmp(callpark_number, "number=", 7)) {
++			callpark_number += 7;
++			options = strchr(callpark_number, ';');
++			if (options) {
++				*options = '\0';
++			}
++		}
+ 	}
+ 
+ 	/* Handle authentication if we're new and not a retransmission. We can't just
+@@ -27721,8 +27788,18 @@
+ 		enum subscriptiontype subscribed = NONE;
+ 		const char *unknown_accept = NULL;
+ 
+-                /* Get destination right away */
+-                gotdest = get_destination(p, NULL, NULL);
++		/* Get destination right away */
++		gotdest = get_destination(p, NULL, NULL);
++
++		/* for nakayo park */
++		if (!strcmp(event, "callpark")) {
++			gotdest = 0;
++		}
++		/* for nakayo line */
++		if (!strcmp(event, "line-key-set")) {
++			gotdest = 0;
++		}
++
+ 		if (gotdest != SIP_GET_DEST_EXTEN_FOUND) {
+ 			if (gotdest == SIP_GET_DEST_INVALID_URI) {
+ 				transmit_response(p, "416 Unsupported URI scheme", req);
+@@ -27873,6 +27950,14 @@
+ 		/* Do not release authpeer here */
+ 	} else if (!strcmp(event, "call-completion")) {
+ 		handle_cc_subscribe(p, req);
++	} else if (!strcmp(event, "callpark") && callpark_number && callpark_number[0] != '\0') { 
++		/* for nakayo park */
++		ast_string_field_set(p, exten, callpark_number);
++		p->subscribed = NAKAYO_PARK;
++	} else if (!strcmp(event, "line-key-set") && callpark_number && callpark_number[0] != '\0') { 
++		/* for nakayo line */
++		ast_string_field_set(p, exten, callpark_number);
++		p->subscribed = NAKAYO_LINE;
+ 	} else { /* At this point, Asterisk does not understand the specified event */
+ 		transmit_response(p, "489 Bad Event", req);
+ 		ast_debug(2, "Received SIP subscribe for unknown event package: %s\n", event);
+@@ -28343,6 +28428,8 @@
+ 			ast_verbose("Receiving INFO!\n");
+ 		if (!req->ignore)
+ 			handle_request_info(p, req);
++		else if (!strcasecmp(sip_get_header(req, "Content-Type"), "application/callcontrol"))
++			; /* do nothing for nakayo park */
+ 		else  /* if ignoring, transmit response */
+ 			transmit_response(p, "200 OK", req);
+ 		break;
+@@ -34889,3 +34976,4 @@
+ 		.load_pri = AST_MODPRI_CHANNEL_DRIVER,
+ 		.nonoptreq = "res_crypto,chan_local,res_http_websocket",
+ 	       );
++
+--- ../asterisk-11.13.0_orig/asterisk-11.13.0/channels/sip/include/sip.h	2014-07-01 04:42:18.000000000 +0900
++++ channels/sip/include/sip.h	2014-10-23 21:07:45.857153881 +0900
+@@ -465,6 +465,8 @@
+ 	PIDF_XML,
+ 	MWI_NOTIFICATION,
+ 	CALL_COMPLETION,
++	NAKAYO_PARK,
++	NAKAYO_LINE,
+ };
+ 
+ /*! \brief The number of media types in enum \ref media_type below. */
+
